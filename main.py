@@ -1,153 +1,80 @@
-import logging
-from os import unlink, mkdir
-from os.path import isdir, join, isfile
-import cv2
-from pyrogram import Client, filters
-from pyrogram.errors import exceptions
-
-logging.basicConfig(filename='exceptions.txt', filemode='a+')
-
-# ============== Settings ============== #
-RAW_PHOTOS_DIR = 'raw_photos'
-OUT_PHOTO_DIR = 'out_photos'
-OUT_PHOTOS_BEGIN = 'output_'
-REPLY_MESSAGE = False
-
-MASK_IMAGE = cv2.imread('face.png', -1)
-
-SENTENCES = {
-    "start": "Hi, I search for faces in sent photos and if I find any I replace them for Troll face .\n\nThe source code can be found [here](https://github.com/parsapoorsh/Troll-Maker-tg-bot)",
-    "no_face": "No faces found in this image",
-    "bad_reply": f"You must reply a photo",
-    "caption": f"We do a little Trolling",
-    "new_member_caption": "[Welcome, You are Trolled.](tg://user?id={user_id})"
-}
-
-detector_args = dict(
-    face_cc=cv2.CascadeClassifier('haarcascade_frontalface_alt.xml'),
-    clahe=cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)),
-    scaleFactor=1.1,
-    minNeighbors=5,
-    minSize=(80, 80),
-    flags=cv2.CASCADE_SCALE_IMAGE | cv2.CASCADE_DO_ROUGH_SEARCH
+from pyrogram import Client, filters, types, enums
+import io
+from utils import FaceDetector
+from config import (
+    MASK_PATH, FACE_CC_PATH,
+    SENTENCES, MAX_FILE_SIZE,
+    API_ID, API_HASH, BOT_TOKEN
 )
-# ============== Settings ============== #
 
-bot = Client(":memory:", config_file="config.ini", sleep_threshold=1000)
-with bot: BOT_USERNAME = bot.get_me().username
-
-chats = (filters.group | filters.channel | filters.private) & ~filters.edited
-
-if not isdir(RAW_PHOTOS_DIR): mkdir(RAW_PHOTOS_DIR)
-if not isdir(OUT_PHOTO_DIR): mkdir(OUT_PHOTO_DIR)
-
-
-def replace_img(img, mask, pos):
-    # replace all !
-    for (x, y, w, h) in pos:
-        mask_res = cv2.resize(mask, (w, h))
-        # Copy the resize image keeping the alpha channel
-        for c in range(0, 3):
-            img[y:y + h, x:x + w, c] = mask_res[:, :, c] * (mask_res[:, :, 3] / 255.0) + img[y:y + h, x:x + w, c] * (
-                        1.0 - (mask_res[:, :, 3] / 255.0))
-    return img
+face_detector = FaceDetector(FACE_CC_PATH)
+mask = face_detector.imread(MASK_PATH)
+bot = Client(
+    "troll_maker",
+    in_memory=True,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 
-face_detector = lambda img, face_cc, clahe, **args: face_cc.detectMultiScale(
-    clahe.apply(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)), **args)
+@bot.on_message(filters.command('start'), group=0)
+async def start(_, m: types.Message):
+    await m.reply(SENTENCES["start"], True)
 
 
-@bot.on_message(filters.photo & chats, group=1)
-async def Photo_Handler(client, message, say_no_face=False):
-    photo = message.photo
-    photo_dir = join(RAW_PHOTOS_DIR, f"{photo.file_id}.jpg")
-    out_photo = join(OUT_PHOTO_DIR, f"{OUT_PHOTOS_BEGIN}{photo.file_id}.jpg")
-    if photo.file_size < 10 * 1024 * 1024:  # If the photo size is less than 10 MB
-        try:
-            await message.download(photo_dir)  # download photo
-            if isfile(photo_dir):
-                # search for faces
-                raw_photo = cv2.imread(photo_dir, -1)
-                face_detector_result = face_detector(raw_photo, **detector_args)
-                unlink(photo_dir)
-                if len(face_detector_result) > 0:  # If there was a face in the photo
-                    cv2.imwrite(out_photo, replace_img(raw_photo, MASK_IMAGE, face_detector_result))
-                    try:
-                        await client.send_chat_action(message.chat.id, "upload_photo")
-                        if REPLY_MESSAGE:
-                            await message.reply_photo(photo=out_photo, caption=SENTENCES['caption'])
-                        else:
-                            await client.send_photo(chat_id=message.chat.id, photo=out_photo,
-                                                    caption=SENTENCES['caption'])
-                    except (exceptions.forbidden_403.ChatWriteForbidden, \
-                            exceptions.forbidden_403.ChatSendMediaForbidden):
-                        await message.chat.leave()
-                    finally:
-                        unlink(out_photo)
-                else:
-                    try:
-                        if say_no_face: await message.reply(SENTENCES["no_face"])
-                    except exceptions.forbidden_403.ChatWriteForbidden:
-                        await message.chat.leave()
-        except Exception as e:
-            logging.exception(e)
+@bot.on_message(filters.photo, group=1)
+async def photo_handler(app: Client, m: types.Message, troll_it=False):
+    if m.photo.file_size > MAX_FILE_SIZE:
+        return
+    if m.media_group_id is not None:
+        return
+    file = await m.download(in_memory=True)
+    file.seek(0)
+    img = face_detector.imread(file)
+    pos = face_detector.detect(img)
+    if len(pos) == 0:
+        if troll_it:
+            await m.reply(SENTENCES["no_face"], True)
+        return
+    await app.send_chat_action(m.chat.id, enums.ChatAction.UPLOAD_PHOTO)
+    img = face_detector.replace(img, mask, pos)
+    file = io.BytesIO()
+    face_detector.im2file(img, file)
+    await m.reply_photo(file, caption=SENTENCES["caption"])
 
 
 @bot.on_message(filters.new_chat_members & filters.group, group=2)
-async def Profile_Handler(client, message):
-    for new_chat_member in message.new_chat_members:
-        if not new_chat_member.is_bot:
-            profiles = await client.get_profile_photos(new_chat_member.id)
-            for profile in profiles:
-                if profile.file_size < 10 * 1024 * 1024:
-                    photo_dir = join(RAW_PHOTOS_DIR, f"{profile.file_id}.jpg")
-                    out_photo = join(OUT_PHOTO_DIR, f"{OUT_PHOTOS_BEGIN}{profile.file_id}.jpg")
-                    try:
-                        await client.download_media(profile, photo_dir)
-                        if isfile(photo_dir):
-                            raw_photo = cv2.imread(photo_dir, -1)
-                            face_detector_result = face_detector(raw_photo, **detector_args)
-                            unlink(photo_dir)
-                            if len(face_detector_result) > 0:  # If there was a face in the photo
-                                cv2.imwrite(out_photo, replace_img(raw_photo, MASK_IMAGE, face_detector_result))
-                                try:
-                                    await client.send_chat_action(message.chat.id, "upload_photo")
-                                    await message.reply_photo(photo=out_photo,
-                                                              caption=SENTENCES['new_member_caption'].format(
-                                                                  user_id=new_chat_member.id)
-                                                              )
-                                    break
-                                except (exceptions.forbidden_403.ChatWriteForbidden, \
-                                        exceptions.forbidden_403.ChatSendMediaForbidden):
-                                    await message.chat.leave()
-                                finally:
-                                    unlink(out_photo)
-                    except Exception as e:
-                        logging.exception(e)
+async def profile_handler(app: Client, m: types.Message):
+    for user in m.new_chat_members:
+        if user.is_bot:
+            continue
+        profiles = app.get_chat_photos(user.id)
+        async for photo in profiles:
+            if photo.file_size > MAX_FILE_SIZE:
+                continue
+            file = await app.download_media(photo.file_id, in_memory=True)
+            file.seek(0)
+            img = face_detector.imread(file)
+            pos = face_detector.detect(img)
+            if len(pos) == 0:
+                continue
+            await app.send_chat_action(m.chat.id, enums.ChatAction.UPLOAD_PHOTO)
+            img = face_detector.replace(img, mask, pos)
+            file = io.BytesIO()
+            face_detector.im2file(img, file)
+            await m.reply_photo(file, caption=SENTENCES['new_member_caption'].format(user_id=user.id))
+            break
 
 
-@bot.on_message(filters.regex(f'(\/|!)(troll_it)($|@{BOT_USERNAME})') & chats, group=3)
-async def face_it_Handler(client, message):
-    try:
-        if message.reply_to_message and message.reply_to_message.photo:
-            message.reply_to_message.message_id = message.message_id
-            await Photo_Handler(client, message.reply_to_message, say_no_face=True)
-        else:
-            await message.reply(SENTENCES["bad_reply"])
-    except exceptions.forbidden_403.ChatWriteForbidden:
-        await message.chat.leave()
-    except Exception as e:
-        logging.exception(e)
+@bot.on_message(filters.command('troll_it'), group=0)
+async def troll_it_handler(app: Client, m: types.Message):
+    if m.reply_to_message is None or m.reply_to_message.photo is None:
+        await m.reply(SENTENCES["bad_reply"], True)
+        return
+    await photo_handler(app, m.reply_to_message, True)
 
-
-@bot.on_message(filters.regex(f'(!|\/)(start)($|@{BOT_USERNAME})') & chats, group=3)
-async def start(client, message):
-    try:
-        await message.reply(SENTENCES["start"])  # , disable_web_page_preview = True )
-    except exceptions.forbidden_403.ChatWriteForbidden:
-        await message.chat.leave()
-    except Exception as e:
-        logging.exception(e)
-
-
-bot.run()
+if __name__ == '__main__':
+    print(f'[{bot.me.username}] starting')
+    bot.run()
+    print(f'[{bot.me.username}] stopped')
