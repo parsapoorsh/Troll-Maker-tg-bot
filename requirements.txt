@@ -1,0 +1,4 @@
+opencv-python==4.7.0.72
+Pyrogram==2.0.106
+tgcrypto
+numpy==1.24.3
